@@ -633,7 +633,7 @@ safe_syscall4(pid_t, wait4, pid_t, pid, int *, status, int, options, \
 #endif
 safe_syscall5(int, waitid, idtype_t, idtype, id_t, id, siginfo_t *, infop, \
               int, options, struct rusage *, rusage)
-safe_syscall3(int, execve, const char *, filename, char **, argv, char **, envp)
+safe_syscall5(int, execveat, int, dirfd, const char *, pathname, char **, argv, char **, envp, int, flags)
 #if defined(TARGET_NR_select) || defined(TARGET_NR__newselect) || \
     defined(TARGET_NR_pselect6) || defined(TARGET_NR_pselect6_time64)
 safe_syscall6(int, pselect6, int, nfds, fd_set *, readfds, fd_set *, writefds, \
@@ -8869,8 +8869,18 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
              * before the execve completes and makes it the other
              * program's problem.
              */
-            ret = get_errno(safe_execve(p, argp, envp));
-            unlock_user(p, arg1, 0);
+            {
+                int execfd = get_errno(do_openat(cpu_env, AT_FDCWD, p, O_PATH, 0));
+                unlock_user(p, arg1, 0);
+                if (is_error(execfd)) {
+                    ret = execfd;
+                    goto execve_end;
+                }
+                ret = get_errno(safe_execveat(execfd, "",
+                                              argp, envp,
+                                              AT_EMPTY_PATH));
+                close(execfd);
+            }
 
             goto execve_end;
 
