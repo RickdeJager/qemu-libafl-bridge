@@ -76,6 +76,7 @@ int libafl_qemu_set_breakpoint(uint64_t addr);
 int libafl_qemu_remove_breakpoint(uint64_t addr);
 int libafl_qemu_set_hook(uint64_t addr, void (*callback)(uint64_t), uint64_t value);
 int libafl_qemu_remove_hook(uint64_t addr);
+void libafl_qemu_suspend_other_threads(void);
 void libafl_flush_jit(void);
 
 int libafl_qemu_write_reg(int reg, uint8_t* val)
@@ -226,6 +227,18 @@ void libafl_flush_jit(void)
     CPU_FOREACH(cpu) {
         tb_flush(cpu);
     }
+}
+
+void libafl_qemu_suspend_other_threads(void)
+{
+    CPUState *cpu;
+    CPUState *libafl_current_cpu = env_cpu(libafl_qemu_env);
+    CPU_FOREACH(cpu) {
+        if (cpu != libafl_current_cpu) {
+            cpu_exit(cpu);
+        }
+    }
+    // TODO; Wait for exits to complete
 }
 
 //// --- End LibAFL code ---
