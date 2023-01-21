@@ -33,13 +33,145 @@
 
 //// --- Begin LibAFL code ---
 
+#ifndef CONFIG_USER_ONLY
+
+#include "sysemu/runstate.h"
+#include "migration/snapshot.h"
+#include "qapi/error.h"
+#include "qemu/error-report.h"
+#include "qemu/main-loop.h"
+#include "hw/core/cpu.h"
+#include "sysemu/hw_accel.h"
+#include <stdlib.h>
+#include <string.h>
+
+void libafl_save_qemu_snapshot(char *name, bool sync);
+void libafl_load_qemu_snapshot(char *name, bool sync);
+
+static void save_snapshot_cb(void* opaque)
+{
+    char* name = (char*)opaque;
+    Error *err = NULL;
+    if(!save_snapshot(name, true, NULL, false, NULL, &err)) {
+        error_report_err(err);
+        error_report("Could not save snapshot");
+    }
+    free(opaque);
+}
+
+void libafl_save_qemu_snapshot(char *name, bool sync)
+{
+    // use snapshots synchronously, use if main loop is not running
+    if (sync) {
+        //TODO: eliminate this code duplication
+        //by passing a heap-allocated buffer from rust to c,
+        //which c needs to free
+        Error *err = NULL;
+        if(!save_snapshot(name, true, NULL, false, NULL, &err)) {
+            error_report_err(err);
+            error_report("Could not save snapshot");
+        }
+        return;
+    }
+    char* name_buffer = malloc(strlen(name)+1);
+    strcpy(name_buffer, name);
+    aio_bh_schedule_oneshot_full(qemu_get_aio_context(), save_snapshot_cb, (void*)name_buffer, "save_snapshot");
+}
+
+static void load_snapshot_cb(void* opaque)
+{
+    char* name = (char*)opaque;
+    Error *err = NULL;
+
+    int saved_vm_running = runstate_is_running();
+    vm_stop(RUN_STATE_RESTORE_VM);
+
+    bool loaded = load_snapshot(name, NULL, false, NULL, &err);
+
+    if(!loaded) {
+        error_report_err(err);
+        error_report("Could not load snapshot");
+    }
+    if (loaded && saved_vm_running) {
+        vm_start();
+    }
+    free(opaque);
+}
+
+void libafl_load_qemu_snapshot(char *name, bool sync)
+{
+    // use snapshots synchronously, use if main loop is not running
+    if (sync) {
+        //TODO: see libafl_save_qemu_snapshot
+        Error *err = NULL;
+
+        int saved_vm_running = runstate_is_running();
+        vm_stop(RUN_STATE_RESTORE_VM);
+
+        bool loaded = load_snapshot(name, NULL, false, NULL, &err);
+
+        if(!loaded) {
+            error_report_err(err);
+            error_report("Could not load snapshot");
+        }
+        if (loaded && saved_vm_running) {
+            vm_start();
+        }
+        return;
+    }
+    char* name_buffer = malloc(strlen(name)+1);
+    strcpy(name_buffer, name);
+    aio_bh_schedule_oneshot_full(qemu_get_aio_context(), load_snapshot_cb, (void*)name_buffer, "load_snapshot");
+}
+
+#endif
+
 #define EXCP_LIBAFL_BP 0xf4775747
 
-void HELPER(libafl_qemu_handle_breakpoint)(CPUArchState *env)
+int libafl_qemu_break_asap = 0;
+
+CPUState* libafl_breakpoint_cpu;
+vaddr libafl_breakpoint_pc;
+
+#ifdef TARGET_ARM
+#define THUMB_MASK(value) (value | libafl_breakpoint_cpu->env_ptr->thumb)
+#else
+#define THUMB_MASK(value) value
+#endif
+
+void libafl_qemu_trigger_breakpoint(CPUState* cpu);
+
+void libafl_sync_breakpoint_cpu(void);
+
+void libafl_sync_breakpoint_cpu(void)
+{
+    if (libafl_breakpoint_pc) {
+        CPUClass* cc = CPU_GET_CLASS(libafl_breakpoint_cpu);
+        cc->set_pc(libafl_breakpoint_cpu, THUMB_MASK(libafl_breakpoint_pc));
+    }
+    libafl_breakpoint_pc = 0;
+}
+
+void libafl_qemu_trigger_breakpoint(CPUState* cpu)
+{
+  libafl_breakpoint_cpu = cpu;
+#ifndef CONFIG_USER_ONLY
+    qemu_system_debug_request();
+    cpu->stopped = true;
+#endif
+    if (cpu->running) {
+        cpu->exception_index = EXCP_LIBAFL_BP;
+        cpu_loop_exit(cpu);
+    } else {
+        libafl_qemu_break_asap = 1;
+    }
+}
+
+void HELPER(libafl_qemu_handle_breakpoint)(CPUArchState *env, target_ulong pc)
 {
     CPUState* cpu = env_cpu(env);
-    cpu->exception_index = EXCP_LIBAFL_BP;
-    cpu_loop_exit(cpu);
+    libafl_breakpoint_pc = pc;
+    libafl_qemu_trigger_breakpoint(cpu);
 }
 
 //// --- End LibAFL code ---

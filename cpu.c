@@ -18,7 +18,6 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu-common.h"
 #include "qapi/error.h"
 
 #include "exec/target_page.h"
@@ -35,16 +34,22 @@
 #include "sysemu/tcg.h"
 #include "sysemu/kvm.h"
 #include "sysemu/replay.h"
+#include "exec/cpu-common.h"
+#include "exec/exec-all.h"
 #include "exec/translate-all.h"
 #include "exec/log.h"
 #include "hw/core/accel-cpu.h"
 #include "trace/trace-root.h"
+#include "qemu/accel.h"
 
 //// --- Begin LibAFL code ---
 
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-internal.h"
 #include "exec/helper-head.h"
+
+#define LIBAFL_TABLES_SIZE 16384
+#define LIBAFL_TABLES_HASH(p) (((13*((size_t)(p))) ^ (((size_t)(p)) >> 15)) % LIBAFL_TABLES_SIZE)
 
 struct libafl_breakpoint {
     target_ulong addr;
@@ -55,40 +60,104 @@ struct libafl_breakpoint* libafl_qemu_breakpoints = NULL;
 
 struct libafl_hook {
     target_ulong addr;
-    void (*callback)(uint64_t);
-    uint64_t value;
+    void (*callback)(target_ulong, uint64_t);
+    uint64_t data;
     TCGHelperInfo helper_info;
+    size_t num;
     struct libafl_hook* next;
 };
 
-struct libafl_hook* libafl_qemu_hooks = NULL;
+struct libafl_hook* libafl_qemu_hooks[LIBAFL_TABLES_SIZE];
+size_t libafl_qemu_hooks_num = 0;
 
-__thread CPUArchState *libafl_qemu_env;
+__thread int libafl_valid_current_cpu = 0;
 
 void libafl_helper_table_add(TCGHelperInfo* info);
 
-static GByteArray *libafl_qemu_mem_buf = NULL;
+static __thread GByteArray *libafl_qemu_mem_buf = NULL;
 
-int libafl_qemu_write_reg(int reg, uint8_t* val);
-int libafl_qemu_read_reg(int reg, uint8_t* val);
-int libafl_qemu_num_regs(void);
-int libafl_qemu_set_breakpoint(uint64_t addr);
-int libafl_qemu_remove_breakpoint(uint64_t addr);
-int libafl_qemu_set_hook(uint64_t addr, void (*callback)(uint64_t), uint64_t value);
-int libafl_qemu_remove_hook(uint64_t addr);
+target_ulong libafl_page_from_addr(target_ulong addr);
+
+CPUState* libafl_qemu_get_cpu(int cpu_index);
+int libafl_qemu_num_cpus(void);
+CPUState* libafl_qemu_current_cpu(void);
+int libafl_qemu_cpu_index(CPUState*);
+
+int libafl_qemu_write_reg(CPUState* cpu, int reg, uint8_t* val);
+int libafl_qemu_read_reg(CPUState* cpu, int reg, uint8_t* val);
+int libafl_qemu_num_regs(CPUState* cpu);
+
+int libafl_qemu_set_breakpoint(target_ulong addr);
+int libafl_qemu_remove_breakpoint(target_ulong addr);
+size_t libafl_qemu_set_hook(target_ulong pc, void (*callback)(target_ulong, uint64_t),
+                            uint64_t data, int invalidate);
+size_t libafl_qemu_remove_hooks_at(target_ulong addr, int invalidate);
+int libafl_qemu_remove_hook(size_t num, int invalidate);
+struct libafl_hook* libafl_search_hook(target_ulong addr);
 void libafl_qemu_suspend_other_threads(void);
 void libafl_flush_jit(void);
 
-int libafl_qemu_write_reg(int reg, uint8_t* val)
-{
-    CPUState *cpu = current_cpu;
-    if (!cpu) {
-        cpu = env_cpu(libafl_qemu_env);
-        if (!cpu) {
-            return 0;
-        }
-    }
+extern CPUState* libafl_breakpoint_cpu;
 
+extern int libafl_restoring_devices;
+
+/*
+void* libafl_qemu_g2h(CPUState *cpu, target_ulong x);
+target_ulong libafl_qemu_h2g(CPUState *cpu, void* x);
+
+void* libafl_qemu_g2h(CPUState *cpu, target_ulong x)
+{
+    return g2h(cpu, x);
+}
+
+target_ulong libafl_qemu_h2g(CPUState *cpu, void* x)
+{
+    return h2g(cpu, x);
+}
+*/
+
+target_ulong libafl_page_from_addr(target_ulong addr) {
+    return addr & TARGET_PAGE_MASK;
+}
+
+CPUState* libafl_qemu_get_cpu(int cpu_index)
+{
+    CPUState *cpu;
+    CPU_FOREACH(cpu) {
+        if (cpu->cpu_index == cpu_index)
+            return cpu;
+    }
+    return NULL;
+}
+
+int libafl_qemu_num_cpus(void)
+{
+    CPUState *cpu;
+    int num = 0;
+    CPU_FOREACH(cpu) {
+        num++;
+    }
+    return num;
+}
+
+CPUState* libafl_qemu_current_cpu(void)
+{
+#ifndef CONFIG_USER_ONLY
+    if (current_cpu == NULL) {
+        return libafl_breakpoint_cpu;
+    }
+#endif
+    return current_cpu;
+}
+
+int libafl_qemu_cpu_index(CPUState* cpu)
+{
+    if (cpu) return cpu->cpu_index;
+    return -1;
+}
+
+int libafl_qemu_write_reg(CPUState* cpu, int reg, uint8_t* val)
+{
     CPUClass *cc = CPU_GET_CLASS(cpu);
     if (reg < cc->gdb_num_core_regs) {
         return cc->gdb_write_register(cpu, val, reg);
@@ -96,16 +165,8 @@ int libafl_qemu_write_reg(int reg, uint8_t* val)
     return 0;
 }
 
-int libafl_qemu_read_reg(int reg, uint8_t* val)
+int libafl_qemu_read_reg(CPUState* cpu, int reg, uint8_t* val)
 {
-    CPUState *cpu = current_cpu;
-    if (!cpu) {
-        cpu = env_cpu(libafl_qemu_env);
-        if (!cpu) {
-            return 0;
-        }
-    }
-
     if (libafl_qemu_mem_buf == NULL) {
         libafl_qemu_mem_buf = g_byte_array_sized_new(64);
     }
@@ -122,27 +183,18 @@ int libafl_qemu_read_reg(int reg, uint8_t* val)
     return 0;
 }
 
-int libafl_qemu_num_regs(void)
+int libafl_qemu_num_regs(CPUState* cpu)
 {
-    CPUState *cpu = current_cpu;
-    if (!cpu) {
-        cpu = env_cpu(libafl_qemu_env);
-        if (!cpu) {
-            return 0;
-        }
-    }
-
     CPUClass *cc = CPU_GET_CLASS(cpu);
     return cc->gdb_num_core_regs;
 }
 
 void libafl_breakpoint_invalidate(CPUState *cpu, target_ulong pc);
 
-int libafl_qemu_set_breakpoint(uint64_t addr)
+int libafl_qemu_set_breakpoint(target_ulong pc)
 {
     CPUState *cpu;
 
-    target_ulong pc = (target_ulong) addr;
     CPU_FOREACH(cpu) {
         libafl_breakpoint_invalidate(cpu, pc);
     }
@@ -154,12 +206,11 @@ int libafl_qemu_set_breakpoint(uint64_t addr)
     return 1;
 }
 
-int libafl_qemu_remove_breakpoint(uint64_t addr)
+int libafl_qemu_remove_breakpoint(target_ulong pc)
 {
     CPUState *cpu;
     int r = 0;
 
-    target_ulong pc = (target_ulong) addr;
     struct libafl_breakpoint** bp = &libafl_qemu_breakpoints;
     while (*bp) {
         if ((*bp)->addr == pc) {
@@ -176,49 +227,100 @@ int libafl_qemu_remove_breakpoint(uint64_t addr)
     return r;
 }
 
-int libafl_qemu_set_hook(uint64_t addr, void (*callback)(uint64_t), uint64_t value)
+size_t libafl_qemu_set_hook(target_ulong pc, void (*callback)(target_ulong, uint64_t),
+                            uint64_t data, int invalidate)
 {
     CPUState *cpu;
 
-    target_ulong pc = (target_ulong) addr;
-    CPU_FOREACH(cpu) {
-        libafl_breakpoint_invalidate(cpu, pc);
+    if (invalidate) {
+        CPU_FOREACH(cpu) {
+            libafl_breakpoint_invalidate(cpu, pc);
+        }
     }
+
+    size_t idx = LIBAFL_TABLES_HASH(pc);
 
     struct libafl_hook* hk = malloc(sizeof(struct libafl_hook));
     hk->addr = pc;
     hk->callback = callback;
-    hk->value = value;
+    hk->data = data;
     hk->helper_info.func = callback;
     hk->helper_info.name = "libafl_hook";
     hk->helper_info.flags = dh_callflag(void);
-    hk->helper_info.typemask = dh_typemask(void, 0) | dh_typemask(i64, 1);
-    hk->next = libafl_qemu_hooks;
-    libafl_qemu_hooks = hk;
+    hk->helper_info.typemask = dh_typemask(void, 0) | dh_typemask(tl, 1) | dh_typemask(i64, 2);
+    hk->num = libafl_qemu_hooks_num++;
+    hk->next = libafl_qemu_hooks[idx];
+    libafl_qemu_hooks[idx] = hk;
     libafl_helper_table_add(&hk->helper_info);
-    return 1;
+    return hk->num;
 }
 
-int libafl_qemu_remove_hook(uint64_t addr)
+size_t libafl_qemu_remove_hooks_at(target_ulong addr, int invalidate)
 {
     CPUState *cpu;
-    int r = 0;
-
-    target_ulong pc = (target_ulong) addr;
-    struct libafl_hook** hk = &libafl_qemu_hooks;
+    size_t r = 0;
+    
+    size_t idx = LIBAFL_TABLES_HASH(addr);
+    struct libafl_hook** hk = &libafl_qemu_hooks[idx];
     while (*hk) {
-        if ((*hk)->addr == pc) {
-            CPU_FOREACH(cpu) {
-                libafl_breakpoint_invalidate(cpu, pc);
+        if ((*hk)->addr == addr) {
+            if (invalidate) {
+                CPU_FOREACH(cpu) {
+                    libafl_breakpoint_invalidate(cpu, addr);
+                }
             }
 
+            void *tmp = *hk;
             *hk = (*hk)->next;
-            r = 1;
+            free(tmp);
+            r++;
         } else {
             hk = &(*hk)->next;
         }
     }
     return r;
+}
+
+int libafl_qemu_remove_hook(size_t num, int invalidate)
+{
+    CPUState *cpu;
+    size_t idx;
+    
+    for (idx = 0; idx < LIBAFL_TABLES_SIZE; ++idx) {
+        struct libafl_hook** hk = &libafl_qemu_hooks[idx];
+        while (*hk) {
+            if ((*hk)->num == num) {
+                if (invalidate) {
+                    CPU_FOREACH(cpu) {
+                        libafl_breakpoint_invalidate(cpu, (*hk)->addr);
+                    }
+                }
+
+                void *tmp = *hk;
+                *hk = (*hk)->next;
+                free(tmp);
+                return 1;
+            } else {
+                hk = &(*hk)->next;
+            }
+        }
+    }
+    return 0;
+}
+
+struct libafl_hook* libafl_search_hook(target_ulong addr)
+{
+    size_t idx = LIBAFL_TABLES_HASH(addr);
+
+    struct libafl_hook* hk = libafl_qemu_hooks[idx];
+    while (hk) {
+        if (hk->addr == addr) {
+            return hk;
+        }
+        hk = hk->next;
+    }
+    
+    return NULL;
 }
 
 void libafl_flush_jit(void)
@@ -261,7 +363,15 @@ static int cpu_common_post_load(void *opaque, int version_id)
      * memory we've translated code from. So we must flush all TBs,
      * which will now be stale.
      */
-    tb_flush(cpu);
+    //tb_flush(cpu);
+
+//// --- Begin LibAFL code ---
+
+    // flushing the TBs every restore makes it really slow
+    // TODO handle writes to X code with specific calls to tb_invalidate_phys_addr
+    if (!libafl_restoring_devices) tb_flush(cpu);
+
+//// --- End LibAFL code ---
 
     return 0;
 }
@@ -332,17 +442,24 @@ const VMStateDescription vmstate_cpu_common = {
 
 void cpu_exec_realizefn(CPUState *cpu, Error **errp)
 {
-#ifndef CONFIG_USER_ONLY
-    CPUClass *cc = CPU_GET_CLASS(cpu);
-#endif
+    /* cache the cpu class for the hotpath */
+    cpu->cc = CPU_GET_CLASS(cpu);
 
-    cpu_list_add(cpu);
     if (!accel_cpu_realizefn(cpu, errp)) {
         return;
     }
+
     /* NB: errp parameter is unused currently */
     if (tcg_enabled()) {
         tcg_exec_realizefn(cpu, errp);
+    }
+
+    /* Wait until cpu initialization complete before exposing cpu. */
+    cpu_list_add(cpu);
+
+    /* Plugin initialization must wait until cpu_index assigned. */
+    if (tcg_enabled()) {
+        qemu_plugin_vcpu_init_hook(cpu);
     }
 
 #ifdef CONFIG_USER_ONLY
@@ -352,8 +469,8 @@ void cpu_exec_realizefn(CPUState *cpu, Error **errp)
     if (qdev_get_vmsd(DEVICE(cpu)) == NULL) {
         vmstate_register(NULL, cpu->cpu_index, &vmstate_cpu_common, cpu);
     }
-    if (cc->sysemu_ops->legacy_vmsd != NULL) {
-        vmstate_register(NULL, cpu->cpu_index, cc->sysemu_ops->legacy_vmsd, cpu);
+    if (cpu->cc->sysemu_ops->legacy_vmsd != NULL) {
+        vmstate_register(NULL, cpu->cpu_index, cpu->cc->sysemu_ops->legacy_vmsd, cpu);
     }
 #endif /* CONFIG_USER_ONLY */
 }
@@ -467,11 +584,19 @@ const char *parse_cpu_option(const char *cpu_option)
     return cpu_type;
 }
 
+void list_cpus(const char *optarg)
+{
+    /* XXX: implement xxx_cpu_list for targets that still miss it */
+#if defined(cpu_list)
+    cpu_list();
+#endif
+}
+
 #if defined(CONFIG_USER_ONLY)
 void tb_invalidate_phys_addr(target_ulong addr)
 {
     mmap_lock();
-    tb_invalidate_phys_page_range(addr, addr + 1);
+    tb_invalidate_phys_page(addr);
     mmap_unlock();
 }
 
@@ -501,13 +626,14 @@ void tb_invalidate_phys_addr(AddressSpace *as, hwaddr addr, MemTxAttrs attrs)
         return;
     }
     ram_addr = memory_region_get_ram_addr(mr) + addr;
-    tb_invalidate_phys_page_range(ram_addr, ram_addr + 1);
+    tb_invalidate_phys_page(ram_addr);
 }
 
 //// --- Begin LibAFL code ---
 
 void libafl_breakpoint_invalidate(CPUState *cpu, target_ulong pc)
 {
+    // TODO invalidate only the virtual pages related to the TB
     tb_flush(cpu);
 }
 
@@ -610,14 +736,14 @@ void cpu_abort(CPUState *cpu, const char *fmt, ...)
     fprintf(stderr, "\n");
     cpu_dump_state(cpu, stderr, CPU_DUMP_FPU | CPU_DUMP_CCOP);
     if (qemu_log_separate()) {
-        FILE *logfile = qemu_log_lock();
-        qemu_log("qemu: fatal: ");
-        qemu_log_vprintf(fmt, ap2);
-        qemu_log("\n");
-        log_cpu_state(cpu, CPU_DUMP_FPU | CPU_DUMP_CCOP);
-        qemu_log_flush();
-        qemu_log_unlock(logfile);
-        qemu_log_close();
+        FILE *logfile = qemu_log_trylock();
+        if (logfile) {
+            fprintf(logfile, "qemu: fatal: ");
+            vfprintf(logfile, fmt, ap2);
+            fprintf(logfile, "\n");
+            cpu_dump_state(cpu, logfile, CPU_DUMP_FPU | CPU_DUMP_CCOP);
+            qemu_log_unlock(logfile);
+        }
     }
     va_end(ap2);
     va_end(ap);
@@ -636,11 +762,11 @@ void cpu_abort(CPUState *cpu, const char *fmt, ...)
 
 /* physical memory access (slow version, mainly for debug) */
 #if defined(CONFIG_USER_ONLY)
-int cpu_memory_rw_debug(CPUState *cpu, target_ulong addr,
-                        void *ptr, target_ulong len, bool is_write)
+int cpu_memory_rw_debug(CPUState *cpu, vaddr addr,
+                        void *ptr, size_t len, bool is_write)
 {
     int flags;
-    target_ulong l, page;
+    vaddr l, page;
     void * p;
     uint8_t *buf = ptr;
 
@@ -679,7 +805,7 @@ int cpu_memory_rw_debug(CPUState *cpu, target_ulong addr,
 
 bool target_words_bigendian(void)
 {
-#if defined(TARGET_WORDS_BIGENDIAN)
+#if TARGET_BIG_ENDIAN
     return true;
 #else
     return false;
@@ -691,7 +817,7 @@ void page_size_init(void)
     /* NOTE: we can always suppose that qemu_host_page_size >=
        TARGET_PAGE_SIZE */
     if (qemu_host_page_size == 0) {
-        qemu_host_page_size = qemu_real_host_page_size;
+        qemu_host_page_size = qemu_real_host_page_size();
     }
     if (qemu_host_page_size < TARGET_PAGE_SIZE) {
         qemu_host_page_size = TARGET_PAGE_SIZE;

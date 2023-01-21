@@ -18,7 +18,6 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu-common.h"
 #include "qemu.h"
 #include "qemu/timer.h"
 #include "user-internals.h"
@@ -138,7 +137,7 @@ static void emulate_vsyscall(CPUX86State *env)
     }
 
     /*
-     * Validate the the pointer arguments.
+     * Validate the pointer arguments.
      */
     switch (syscall) {
     case TARGET_NR_gettimeofday:
@@ -202,10 +201,16 @@ void cpu_loop(CPUX86State *env)
 {
     CPUState *cs = env_cpu(env);
     int trapnr;
-    abi_ulong pc;
     abi_ulong ret;
 
     for(;;) {
+
+//// --- Begin LibAFL code ---
+
+        if (libafl_qemu_break_asap) return;
+
+//// --- End LibAFL code ---
+
         cpu_exec_start(cs);
         trapnr = cpu_exec(cs);
         cpu_exec_end(cs);
@@ -318,9 +323,8 @@ void cpu_loop(CPUX86State *env)
             cpu_exec_step_atomic(cs);
             break;
         default:
-            pc = env->segs[R_CS].base + env->eip;
-            EXCP_DUMP(env, "qemu: 0x%08lx: unhandled CPU exception 0x%x - aborting\n",
-                      (long)pc, trapnr);
+            EXCP_DUMP(env, "qemu: unhandled CPU exception 0x%x - aborting\n",
+                      trapnr);
             abort();
         }
         process_pending_signals(env);

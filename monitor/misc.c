@@ -25,10 +25,8 @@
 #include "qemu/osdep.h"
 #include "monitor-internal.h"
 #include "monitor/qdev.h"
-#include "hw/usb.h"
 #include "hw/pci/pci.h"
 #include "sysemu/watchdog.h"
-#include "hw/loader.h"
 #include "exec/gdbstub.h"
 #include "net/net.h"
 #include "net/slirp.h"
@@ -39,17 +37,14 @@
 #include "ui/input.h"
 #include "audio/audio.h"
 #include "disas/disas.h"
-#include "sysemu/balloon.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
 #include "sysemu/hw_accel.h"
 #include "sysemu/runstate.h"
 #include "authz/list.h"
 #include "qapi/util.h"
-#include "sysemu/blockdev.h"
 #include "sysemu/sysemu.h"
-#include "sysemu/tcg.h"
-#include "sysemu/tpm.h"
+#include "sysemu/device_tree.h"
 #include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qerror.h"
 #include "qapi/qmp/qstring.h"
@@ -77,13 +72,15 @@
 #include "qapi/qapi-init-commands.h"
 #include "qapi/error.h"
 #include "qapi/qmp-event.h"
-#include "sysemu/cpus.h"
 #include "qemu/cutils.h"
 
 #if defined(TARGET_S390X)
 #include "hw/s390x/storage-keys.h"
 #include "hw/s390x/storage-attributes.h"
 #endif
+
+/* Make devices configuration available for use in hmp-commands*.hx templates */
+#include CONFIG_DEVICES
 
 /* file descriptors passed via SCM_RIGHTS */
 typedef struct mon_fd_t mon_fd_t;
@@ -305,6 +302,7 @@ int monitor_get_cpu_index(Monitor *mon)
 static void hmp_info_registers(Monitor *mon, const QDict *qdict)
 {
     bool all_cpus = qdict_get_try_bool(qdict, "cpustate_all", false);
+    int vcpu = qdict_get_try_int(qdict, "vcpu", -1);
     CPUState *cs;
 
     if (all_cpus) {
@@ -313,13 +311,18 @@ static void hmp_info_registers(Monitor *mon, const QDict *qdict)
             cpu_dump_state(cs, NULL, CPU_DUMP_FPU);
         }
     } else {
-        cs = mon_get_cpu(mon);
+        cs = vcpu >= 0 ? qemu_get_cpu(vcpu) : mon_get_cpu(mon);
 
         if (!cs) {
-            monitor_printf(mon, "No CPU available\n");
+            if (vcpu >= 0) {
+                monitor_printf(mon, "CPU#%d not available\n", vcpu);
+            } else {
+                monitor_printf(mon, "No CPU available\n");
+            }
             return;
         }
 
+        monitor_printf(mon, "\nCPU#%d\n", cs->cpu_index);
         cpu_dump_state(cs, NULL, CPU_DUMP_FPU);
     }
 }
@@ -389,7 +392,7 @@ static void hmp_info_trace_events(Monitor *mon, const QDict *qdict)
 void qmp_client_migrate_info(const char *protocol, const char *hostname,
                              bool has_port, int64_t port,
                              bool has_tls_port, int64_t tls_port,
-                             bool has_cert_subject, const char *cert_subject,
+                             const char *cert_subject,
                              Error **errp)
 {
     if (strcmp(protocol, "spice") == 0) {
@@ -419,8 +422,7 @@ static void hmp_logfile(Monitor *mon, const QDict *qdict)
 {
     Error *err = NULL;
 
-    qemu_set_log_filename(qdict_get_str(qdict, "filename"), &err);
-    if (err) {
+    if (!qemu_set_log_filename(qdict_get_str(qdict, "filename"), &err)) {
         error_report_err(err);
     }
 }
@@ -429,6 +431,7 @@ static void hmp_log(Monitor *mon, const QDict *qdict)
 {
     int mask;
     const char *items = qdict_get_str(qdict, "items");
+    Error *err = NULL;
 
     if (!strcmp(items, "none")) {
         mask = 0;
@@ -439,7 +442,10 @@ static void hmp_log(Monitor *mon, const QDict *qdict)
             return;
         }
     }
-    qemu_set_log(mask);
+
+    if (!qemu_set_log(mask, &err)) {
+        error_report_err(err);
+    }
 }
 
 static void hmp_singlestep(Monitor *mon, const QDict *qdict)
@@ -720,7 +726,7 @@ static uint64_t vtop(void *ptr, Error **errp)
     uint64_t pinfo;
     uint64_t ret = -1;
     uintptr_t addr = (uintptr_t) ptr;
-    uintptr_t pagesize = qemu_real_host_page_size;
+    uintptr_t pagesize = qemu_real_host_page_size();
     off_t offset = addr / pagesize * sizeof(pinfo);
     int fd;
 
@@ -1028,7 +1034,7 @@ void qmp_getfd(const char *fdname, Error **errp)
         return;
     }
 
-    monfd = g_malloc0(sizeof(mon_fd_t));
+    monfd = g_new0(mon_fd_t, 1);
     monfd->name = g_strdup(fdname);
     monfd->fd = fd;
 
@@ -1074,6 +1080,7 @@ int monitor_get_fd(Monitor *mon, const char *fdname, Error **errp)
         }
 
         fd = monfd->fd;
+        assert(fd >= 0);
 
         /* caller takes ownership of fd */
         QLIST_REMOVE(monfd, next);
@@ -1120,7 +1127,7 @@ void monitor_fdsets_cleanup(void)
     }
 }
 
-AddfdInfo *qmp_add_fd(bool has_fdset_id, int64_t fdset_id, bool has_opaque,
+AddfdInfo *qmp_add_fd(bool has_fdset_id, int64_t fdset_id,
                       const char *opaque, Error **errp)
 {
     int fd;
@@ -1133,8 +1140,7 @@ AddfdInfo *qmp_add_fd(bool has_fdset_id, int64_t fdset_id, bool has_opaque,
         goto error;
     }
 
-    fdinfo = monitor_fdset_add_fd(fd, has_fdset_id, fdset_id,
-                                  has_opaque, opaque, errp);
+    fdinfo = monitor_fdset_add_fd(fd, has_fdset_id, fdset_id, opaque, errp);
     if (fdinfo) {
         return fdinfo;
     }
@@ -1202,12 +1208,7 @@ FdsetInfoList *qmp_query_fdsets(Error **errp)
 
             fdsetfd_info = g_malloc0(sizeof(*fdsetfd_info));
             fdsetfd_info->fd = mon_fdset_fd->fd;
-            if (mon_fdset_fd->opaque) {
-                fdsetfd_info->has_opaque = true;
-                fdsetfd_info->opaque = g_strdup(mon_fdset_fd->opaque);
-            } else {
-                fdsetfd_info->has_opaque = false;
-            }
+            fdsetfd_info->opaque = g_strdup(mon_fdset_fd->opaque);
 
             QAPI_LIST_PREPEND(fdset_info->fds, fdsetfd_info);
         }
@@ -1219,8 +1220,7 @@ FdsetInfoList *qmp_query_fdsets(Error **errp)
 }
 
 AddfdInfo *monitor_fdset_add_fd(int fd, bool has_fdset_id, int64_t fdset_id,
-                                bool has_opaque, const char *opaque,
-                                Error **errp)
+                                const char *opaque, Error **errp)
 {
     MonFdset *mon_fdset = NULL;
     MonFdsetFd *mon_fdset_fd;
@@ -1288,9 +1288,7 @@ AddfdInfo *monitor_fdset_add_fd(int fd, bool has_fdset_id, int64_t fdset_id,
     mon_fdset_fd = g_malloc0(sizeof(*mon_fdset_fd));
     mon_fdset_fd->fd = fd;
     mon_fdset_fd->removed = false;
-    if (has_opaque) {
-        mon_fdset_fd->opaque = g_strdup(opaque);
-    }
+    mon_fdset_fd->opaque = g_strdup(opaque);
     QLIST_INSERT_HEAD(&mon_fdset->fds, mon_fdset_fd, next);
 
     fdinfo = g_malloc0(sizeof(*fdinfo));
@@ -1391,22 +1389,15 @@ void monitor_fdset_dup_fd_remove(int dup_fd)
 int monitor_fd_param(Monitor *mon, const char *fdname, Error **errp)
 {
     int fd;
-    Error *local_err = NULL;
 
     if (!qemu_isdigit(fdname[0]) && mon) {
-        fd = monitor_get_fd(mon, fdname, &local_err);
+        fd = monitor_get_fd(mon, fdname, errp);
     } else {
         fd = qemu_parse_fd(fdname);
-        if (fd == -1) {
-            error_setg(&local_err, "Invalid file descriptor number '%s'",
+        if (fd < 0) {
+            error_setg(errp, "Invalid file descriptor number '%s'",
                        fdname);
         }
-    }
-    if (local_err) {
-        error_propagate(errp, local_err);
-        assert(fd == -1);
-    } else {
-        assert(fd != -1);
     }
 
     return fd;

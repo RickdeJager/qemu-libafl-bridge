@@ -7,7 +7,7 @@ softmmu_ss.add(files(
   'wavcapture.c',
 ))
 
-softmmu_ss.add(when: coreaudio, if_true: files('coreaudio.c'))
+softmmu_ss.add(when: coreaudio, if_true: files('coreaudio.m'))
 softmmu_ss.add(when: dsound, if_true: files('dsoundaudio.c', 'audio_win_int.c'))
 
 audio_modules = {}
@@ -17,6 +17,7 @@ foreach m : [
   ['pa', pulse, files('paaudio.c')],
   ['sdl', sdl, files('sdlaudio.c')],
   ['jack', jack, files('jackaudio.c')],
+  ['sndio', sndio, files('sndioaudio.c')],
   ['spice', spice, files('spiceaudio.c')]
 ]
   if m[1].found()

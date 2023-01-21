@@ -1131,7 +1131,7 @@ static void tcg_out_goto(TCGContext *s, ARMCond cond, const tcg_insn_unit *addr)
  * The call case is mostly used for helpers - so it's not unreasonable
  * for them to be beyond branch range.
  */
-static void tcg_out_call(TCGContext *s, const tcg_insn_unit *addr)
+static void tcg_out_call_int(TCGContext *s, const tcg_insn_unit *addr)
 {
     intptr_t addri = (intptr_t)addr;
     ptrdiff_t disp = tcg_pcrel_diff(s, addr);
@@ -1148,6 +1148,12 @@ static void tcg_out_call(TCGContext *s, const tcg_insn_unit *addr)
 
     tcg_out_movi32(s, COND_AL, TCG_REG_TMP, addri);
     tcg_out_blx_reg(s, COND_AL, TCG_REG_TMP);
+}
+
+static void tcg_out_call(TCGContext *s, const tcg_insn_unit *addr,
+                         const TCGHelperInfo *info)
+{
+    tcg_out_call_int(s, addr);
 }
 
 static void tcg_out_goto_label(TCGContext *s, ARMCond cond, TCGLabel *l)
@@ -1296,7 +1302,7 @@ static void tcg_out_vldst(TCGContext *s, ARMInsn insn,
 static void * const qemu_ld_helpers[MO_SSIZE + 1] = {
     [MO_UB]   = helper_ret_ldub_mmu,
     [MO_SB]   = helper_ret_ldsb_mmu,
-#ifdef HOST_WORDS_BIGENDIAN
+#if HOST_BIG_ENDIAN
     [MO_UW] = helper_be_lduw_mmu,
     [MO_UL] = helper_be_ldul_mmu,
     [MO_UQ] = helper_be_ldq_mmu,
@@ -1316,7 +1322,7 @@ static void * const qemu_ld_helpers[MO_SSIZE + 1] = {
  */
 static void * const qemu_st_helpers[MO_SIZE + 1] = {
     [MO_8]   = helper_ret_stb_mmu,
-#ifdef HOST_WORDS_BIGENDIAN
+#if HOST_BIG_ENDIAN
     [MO_16] = helper_be_stw_mmu,
     [MO_32] = helper_be_stl_mmu,
     [MO_64] = helper_be_stq_mmu,
@@ -1515,7 +1521,7 @@ static bool tcg_out_qemu_ld_slow_path(TCGContext *s, TCGLabelQemuLdst *lb)
     argreg = tcg_out_arg_reg32(s, argreg, TCG_REG_R14);
 
     /* Use the canonical unsigned helpers and minimize icache usage. */
-    tcg_out_call(s, qemu_ld_helpers[opc & MO_SIZE]);
+    tcg_out_call_int(s, qemu_ld_helpers[opc & MO_SIZE]);
 
     datalo = lb->datalo_reg;
     datahi = lb->datahi_reg;
@@ -1689,8 +1695,21 @@ static void tcg_out_qemu_ld_index(TCGContext *s, MemOp opc,
         /* LDRD requires alignment; double-check that. */
         if (get_alignment_bits(opc) >= MO_64
             && (datalo & 1) == 0 && datahi == datalo + 1) {
-            tcg_out_ldrd_r(s, COND_AL, datalo, addrlo, addend);
-        } else if (scratch_addend) {
+            /*
+             * Rm (the second address op) must not overlap Rt or Rt + 1.
+             * Since datalo is aligned, we can simplify the test via alignment.
+             * Flip the two address arguments if that works.
+             */
+            if ((addend & ~1) != datalo) {
+                tcg_out_ldrd_r(s, COND_AL, datalo, addrlo, addend);
+                break;
+            }
+            if ((addrlo & ~1) != datalo) {
+                tcg_out_ldrd_r(s, COND_AL, datalo, addend, addrlo);
+                break;
+            }
+        }
+        if (scratch_addend) {
             tcg_out_ld32_rwb(s, COND_AL, datalo, addend, addrlo);
             tcg_out_ld32_12(s, COND_AL, datahi, addend, 4);
         } else {

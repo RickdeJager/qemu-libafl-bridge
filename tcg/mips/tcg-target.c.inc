@@ -26,7 +26,7 @@
 
 #include "../tcg-ldst.c.inc"
 
-#ifdef HOST_WORDS_BIGENDIAN
+#if HOST_BIG_ENDIAN
 # define MIPS_BE  1
 #else
 # define MIPS_BE  0
@@ -1020,7 +1020,8 @@ static void tcg_out_call_int(TCGContext *s, const tcg_insn_unit *arg, bool tail)
     }
 }
 
-static void tcg_out_call(TCGContext *s, const tcg_insn_unit *arg)
+static void tcg_out_call(TCGContext *s, const tcg_insn_unit *arg,
+                         const TCGHelperInfo *info)
 {
     tcg_out_call_int(s, arg, false);
     tcg_out_nop(s);
